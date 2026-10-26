@@ -20,14 +20,20 @@ def dashboard(c,user,branch_ids,query):
   branch_ids=[int(bid)]
  lower=(datetime.combine(start,datetime.min.time())-timedelta(hours=3)).isoformat(' ')
  upper=(datetime.combine(end+timedelta(days=1),datetime.min.time())-timedelta(hours=3)).isoformat(' ')
- allowed={o['id']:o for o in c.execute('SELECT id,branch_id,master_id,created,issued_at,status FROM orders WHERE deleted=0') if o['branch_id'] in branch_ids and (user['role']!='master' or o['master_id']==user['id'] or c.execute('SELECT 1 FROM items WHERE order_id=? AND master_id=? AND deleted=0',(o['id'],user['id'])).fetchone())}
+ allowed={o['id']:o for o in c.execute('SELECT id,branch_id,master_id,created,issued_at,status FROM orders WHERE deleted=0 OR issued_at IS NOT NULL') if o['branch_id'] in branch_ids and (user['role']!='master' or o['master_id']==user['id'] or c.execute('SELECT 1 FROM items WHERE order_id=? AND master_id=? AND deleted=0',(o['id'],user['id'])).fetchone())}
  accepted=sum(lower<=o['created']<upper for o in allowed.values())
  issued=sum(bool(o['issued_at']) and lower<=o['issued_at']<upper for o in allowed.values())
  payroll={};revenue=cost=master_total=service=0
- for r in c.execute('SELECT e.*,i.order_id,i.name work_name,u.name master_name FROM earnings e JOIN items i ON i.id=e.item_id LEFT JOIN users u ON u.id=e.master_id WHERE e.issued_at>=? AND e.issued_at<? ORDER BY e.issued_at DESC',(lower,upper)):
+ entries=[dict(r) for r in c.execute('SELECT e.*,i.order_id,i.name work_name,u.name master_name FROM earnings e JOIN items i ON i.id=e.item_id LEFT JOIN users u ON u.id=e.master_id WHERE e.issued_at>=? AND e.issued_at<?',(lower,upper))]
+ for row in c.execute('SELECT e.*,i.order_id,i.name work_name,u.name master_name,r.created returned_date FROM earnings e JOIN items i ON i.id=e.item_id JOIN order_returns r ON r.order_id=i.order_id LEFT JOIN users u ON u.id=e.master_id WHERE r.created>=? AND r.created<?',(lower,upper)):
+  reversal=dict(row)
+  for key in ('revenue','cost','master_share','service_share'):reversal[key]=-reversal[key]
+  reversal['issued_at']=row['returned_date'];reversal['work_name']='Возврат: '+row['work_name'];reversal['reversal']=True;entries.append(reversal)
+ for r in sorted(entries,key=lambda e:e['issued_at'],reverse=True):
   if r['order_id'] not in allowed or (user['role']=='master' and r['master_id']!=user['id']):continue
   revenue+=r['revenue'];cost+=r['cost'];master_total+=r['master_share'];service+=r['service_share']
   person=payroll.setdefault(r['master_id'],{'id':r['master_id'],'name':r['master_name'] or 'Не назначен (старые заказы)','works':0,'revenue':0,'cost':0,'salary':0,'service':0,'details':[]})
-  person['works']+=1;person['revenue']+=r['revenue'];person['cost']+=r['cost'];person['salary']+=r['master_share'];person['service']+=r['service_share']
+  person['works']+=-1 if r.get('reversal') else 1;person['revenue']+=r['revenue'];person['cost']+=r['cost'];person['salary']+=r['master_share'];person['service']+=r['service_share']
   person['details'].append({'order_id':r['order_id'],'name':r['work_name'],'date':r['issued_at'],'salary':r['master_share']})
- return {'from':start.isoformat(),'to':end.isoformat(),'accepted':accepted,'issued':issued,'revenue':revenue,'cost':cost,'profit':revenue-cost,'salary':master_total,'service':service,'payroll':list(payroll.values())}
+ refunds=[r for r in c.execute('SELECT * FROM order_returns WHERE created>=? AND created<?',(lower,upper)) if r['order_id'] in allowed]
+ return {'returned':len(refunds),'refunded':sum(r['amount'] for r in refunds),'from':start.isoformat(),'to':end.isoformat(),'accepted':accepted,'issued':issued,'revenue':revenue,'cost':cost,'profit':revenue-cost,'salary':master_total,'service':service,'payroll':list(payroll.values())}

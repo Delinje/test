@@ -270,6 +270,19 @@ class PayrollWorkflow(Workflow):
    c.execute("UPDATE earnings SET issued_at='2026-10-25 21:30:00'")
   day=self.call(a,'dashboard?from=2026-10-26&to=2026-10-26')[1];self.assertEqual((day['accepted'],day['issued'],day['salary']),(0,1,260000))
   before=self.call(a,'dashboard?from=2026-10-25&to=2026-10-25')[1];self.assertEqual((before['accepted'],before['issued'],before['salary']),(1,0,0))
+  with __import__('sqlite3').connect(self.tmp.name+'/test.sqlite3') as c:
+   money_before=c.execute('SELECT sum(amount) FROM payments').fetchone()[0]
+   payroll_before=c.execute('SELECT count(*),sum(master_share),sum(service_share) FROM earnings').fetchone()
+  self.assertEqual(self.call(a,base+'/delete',{'version':self.call(a,base)[1]['order']['version'],'method':'Карта'})[0],200)
+  self.assertEqual(self.call(a,'orders')[1],[])
+  preserved=self.call(a,'dashboard?from=2026-10-26&to=2026-10-26')[1]
+  self.assertEqual((preserved['issued'],preserved['salary'],preserved['revenue']),(1,0,0))
+  with __import__('sqlite3').connect(self.tmp.name+'/test.sqlite3') as c:
+   self.assertEqual(c.execute('SELECT sum(amount) FROM payments').fetchone()[0],0)
+   self.assertEqual(c.execute('SELECT amount FROM order_returns').fetchone()[0],money_before)
+   self.assertEqual(c.execute('SELECT count(*),sum(master_share),sum(service_share) FROM earnings').fetchone(),payroll_before)
+   self.assertEqual(c.execute('SELECT quantity FROM stock WHERE id=?',(sid,)).fetchone()[0],1)
+  self.assertEqual(self.call(a,base+'/delete',{'version':1})[0],403)
   # Without repair can be free and must still close and remain idempotent.
   empty='orders/'+str(self.call(a,'orders',{'branch_id':1,'client':'Петров','phone':'+79005556677','device':'ПК','fault':'Отказ'})[1]['id'])
   self.assertEqual(self.call(a,empty+'/issue',{'status':'Выдан без ремонта','method':'Наличные','version':1})[0],200)
@@ -363,10 +376,38 @@ class DeleteOrderEditStock(Workflow):
   paid='orders/'+str(self.call(a,'orders',order)[1]['id']);self.call(a,paid+'/payments',{'amount':100,'method':'Карта'})
   self.assertEqual(self.call(a,paid+'/delete',{'version':1})[0],400)
   issued='orders/'+str(self.call(a,'orders',order)[1]['id']);self.call(a,issued+'/issue',{'status':'Выдан без ремонта','method':'Без оплаты','version':1})
-  self.assertEqual(self.call(a,issued+'/delete',{'version':2})[0],400)
+  self.assertEqual(self.call(a,issued+'/delete',{'version':2,'method':'Без оплаты'})[0],200)
   with __import__('sqlite3').connect(self.tmp.name+'/test.sqlite3') as c:
    self.assertEqual(c.execute('SELECT deleted FROM orders WHERE id=1').fetchone()[0],1)
    self.assertTrue(c.execute("SELECT text FROM events WHERE order_id=1 AND text LIKE 'Заказ удалён:%'").fetchone())
    self.assertEqual(c.execute('SELECT sum(quantity) FROM stock_movements WHERE stock_id=?',(sid,)).fetchone()[0],5)
+
+class ReturnWorkflow(Workflow):
+ def test_repair_and_permissions(self):
+  from datetime import datetime,timezone,timedelta
+  a=self.owner
+  self.call(a,'setup',{'name':'Владелец','email':'owner@example.test','password':'test-password-123','branch':'Центр'})
+  self.call(a,'login',{'email':'owner@example.test','password':'test-password-123'})
+  base='orders/'+str(self.call(a,'orders',{'branch_id':1,'client':'Иванов','phone':'89001234567','device':'Телефон','fault':'АКБ','master_id':1})[1]['id'])
+  self.call(a,base+'/items',{'name':'Замена АКБ','kind':'Работа','quantity':1,'price':5500,'warranty':30,'master_id':1})
+  item=self.call(a,base)[1]['items'][0]['id'];sid=self.call(a,'stock',{'name':'АКБ','sku':'BAT','quantity':2,'unit_cost':1000,'branch_id':1})[1]['id']
+  self.call(a,base+'/parts',{'item_id':item,'stock_id':sid,'quantity':1})
+  version=self.call(a,base)[1]['order']['version']
+  self.call(a,base+'/issue',{'status':'Выдан','method':'Карта','version':version});version+=1
+  for data in [{'version':version,'method':'Карта','reason':''},{'version':version,'method':'Без оплаты','reason':'Отказ'},{'version':version-1,'method':'Карта','reason':'Отказ'}]:self.assertEqual(self.call(a,base+'/return',data)[0],400)
+  self.assertEqual(self.call(a,'stock')[1][0]['quantity'],1)
+  today=datetime.now(timezone(timedelta(hours=3))).date();yesterday=today-timedelta(days=1)
+  with __import__('sqlite3').connect(self.tmp.name+'/test.sqlite3') as c:
+   timestamp=yesterday.isoformat()+' 09:00:00';c.execute('UPDATE orders SET issued_at=?',(timestamp,));c.execute('UPDATE earnings SET issued_at=?',(timestamp,))
+  self.assertEqual(self.call(a,base+'/return',{'version':version,'method':'Карта','reason':'Повторная неисправность, клиент отказался от восстановления'})[0],200)
+  detail=self.call(a,base)[1];self.assertEqual(detail['order']['status'],'Возврат');self.assertEqual(detail['return']['amount'],550000);self.assertEqual(sum(p['amount'] for p in detail['payments']),0);self.assertEqual(len(detail['payments']),2)
+  self.assertEqual(self.call(a,'stock')[1][0]['quantity'],2);self.assertEqual(self.call(a,'orders')[1][0]['total'],0)
+  self.assertEqual(self.call(a,base+'/return',{'version':version+1,'method':'Карта','reason':'Повторно'})[0],400)
+  previous=self.call(a,'dashboard?from='+yesterday.isoformat()+'&to='+yesterday.isoformat())[1];self.assertEqual((previous['revenue'],previous['salary']),(550000,180000))
+  current=self.call(a,'dashboard?from='+today.isoformat()+'&to='+today.isoformat())[1];self.assertEqual((current['revenue'],current['salary'],current['refunded'],current['returned']),(-550000,-180000,550000,1))
+  self.assertEqual(self.call(a,base+'/delete',{'version':version+1,'reason':'Удалить после возврата'})[0],200)
+  self.assertEqual(self.call(a,'stock')[1][0]['quantity'],2)
+  with __import__('sqlite3').connect(self.tmp.name+'/test.sqlite3') as c:
+   self.assertEqual(c.execute('SELECT count(*) FROM order_returns').fetchone()[0],1);self.assertEqual(c.execute('SELECT sum(amount) FROM payments').fetchone()[0],0);self.assertEqual(c.execute('SELECT sum(quantity) FROM stock_movements').fetchone()[0],2)
 
 if __name__=='__main__':unittest.main(verbosity=2)
