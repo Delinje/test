@@ -45,9 +45,9 @@ class Workflow(unittest.TestCase):
   self.assertEqual(self.call(a,base+'/status',{'status':'Выдан','version':1})[0],400)
   self.assertEqual(self.call(a,base+'/payments',{'amount':'NaN','method':'Карта'})[0],400)
   self.assertEqual(self.call(a,base+'/payments',{'amount':'5500.25','method':'Карта'})[0],200)
-  self.assertEqual(self.call(a,base+'/status',{'status':'Готов к выдаче','version':1})[0],200)
+  self.assertEqual(self.call(a,base+'/status',{'status':'Готов к выдаче','version':self.call(a,base)[1]['order']['version']})[0],200)
   self.assertEqual(self.call(a,base+'/status',{'status':'Ремонт','version':1})[0],400)
-  self.assertEqual(self.call(a,base+'/status',{'status':'Выдан','version':2})[0],200)
+  self.assertEqual(self.call(a,base+'/issue',{'status':'Выдан','method':'Карта','version':self.call(a,base)[1]['order']['version']})[0],200)
   self.assertEqual(self.call(a,base+'/comment',{'text':'Клиент забрал устройство'})[0],200)
   detail=self.call(a,base)[1];self.assertEqual(detail['order']['status'],'Выдан');self.assertEqual(detail['payments'][0]['amount'],550025);self.assertEqual(len(detail['events']),6)
   self.assertEqual(self.call(a,'users',{'disable':2})[0],200)
@@ -181,7 +181,7 @@ class StockDocumentsWorkflow(Workflow):
   self.assertEqual(sorted(results),[200,400])
   self.assertEqual(next(p for p in self.call(a,'stock')[1] if p['id']==sid)['quantity'],0)
   self.assertEqual(sum(p['quantity'] for p in self.call(a,base)[1]['parts']),3)
-  self.assertEqual(self.call(a,base+'/diagnosis',{'text':'Повреждение цепи <script>alert(1)</script>','version':1})[0],200)
+  self.assertEqual(self.call(a,base+'/diagnosis',{'text':'Повреждение цепи <script>alert(1)</script>','version':self.call(a,base)[1]['order']['version']})[0],200)
   self.assertEqual(self.call(a,base+'/diagnosis',{'text':'Устаревшее','version':1})[0],400)
   def document(client,kind):
    with client.open(self.url+base+'/print?type='+kind) as response:return response.read().decode()
@@ -191,9 +191,87 @@ class StockDocumentsWorkflow(Workflow):
   self.assertEqual(self.call(manager,base+'/print?type=completion')[0],403)
   self.assertEqual(self.call(self.client(),base+'/print?type=completion')[0],401)
   self.call(a,base+'/payments',{'amount':'5600.25','method':'Карта'})
-  self.assertEqual(self.call(a,base+'/status',{'status':'Выдан','version':2})[0],200)
+  self.assertEqual(self.call(a,base+'/issue',{'status':'Выдан','method':'Карта','version':self.call(a,base)[1]['order']['version']})[0],200)
   self.assertEqual(self.call(a,base+'/parts',allocation)[0],400)
   with __import__('sqlite3').connect(self.tmp.name+'/test.sqlite3') as c:
    self.assertEqual(c.execute('SELECT sum(quantity) FROM stock_movements WHERE stock_id=?',(sid,)).fetchone()[0],0)
+
+class SalaryUpgrade(unittest.TestCase):
+ def test_previous_orders_and_salary_migrate_once(self):
+  import importlib.util
+  spec=importlib.util.spec_from_file_location('salary_upgrade',Path(__file__).with_name('server.py'));module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+  with tempfile.TemporaryDirectory() as directory:
+   module.DB=directory+'/old.sqlite3';module.initialize()
+   with module.connection() as c:
+    c.execute('DROP TABLE earnings')
+    c.execute('ALTER TABLE orders DROP COLUMN device_password')
+    c.execute('ALTER TABLE orders DROP COLUMN issued_at')
+    c.execute('ALTER TABLE items DROP COLUMN master_id')
+    c.execute("DELETE FROM migrations WHERE name='issuance_salary_v1'")
+    c.execute("INSERT INTO users(name,email,password,role) VALUES('Мастер','test@example.test','unused','owner')")
+    c.execute("INSERT INTO branches(name) VALUES('Центр')")
+    c.execute("INSERT INTO orders(branch_id,client,phone,device,fault,status,master_id) VALUES(1,'Иванов','+79001234567','ПК','Не включается','Выдан',1)")
+    c.execute("INSERT INTO items(order_id,name,kind,quantity,price,warranty) VALUES(1,'Ремонт','Работа',1,500000,90)")
+    c.execute("INSERT INTO events(order_id,user_id,text,created) VALUES(1,1,'Готов к выдаче → Выдан','2026-10-25 10:00:00')")
+   module.initialize();module.initialize()
+   with module.connection() as c:
+    row=c.execute('SELECT * FROM earnings').fetchone();self.assertEqual(row['master_id'],1);self.assertEqual(row['master_share'],200000);self.assertEqual(row['service_share'],300000)
+    self.assertEqual(c.execute('SELECT count(*) FROM earnings').fetchone()[0],1)
+    self.assertEqual(c.execute('SELECT issued_at FROM orders').fetchone()[0],'2026-10-25 10:00:00')
+    self.assertEqual(c.execute('SELECT device_password FROM orders').fetchone()[0],'')
+
+class PayrollWorkflow(Workflow):
+ def test_repair_and_permissions(self):
+  from concurrent.futures import ThreadPoolExecutor
+  from datetime import datetime,timezone,timedelta
+  a=self.owner
+  self.call(a,'setup',{'name':'Владелец','email':'owner@example.test','password':'test-password-123','branch':'Центр'})
+  self.call(a,'login',{'email':'owner@example.test','password':'test-password-123'})
+  self.call(a,'branches',{'name':'Север'})
+  for name,email,branch in [('Первый','one@example.test',1),('Второй','two@example.test',1),('Чужой','other@example.test',2)]:
+   self.call(a,'users',{'name':name,'email':email,'password':'test-password-123','role':'master','branches':[branch]})
+  one=self.client();two=self.client();other=self.client()
+  for client,email in [(one,'one@example.test'),(two,'two@example.test'),(other,'other@example.test')]:self.call(client,'login',{'email':email,'password':'test-password-123'})
+  base='orders/'+str(self.call(a,'orders',{'branch_id':1,'client':'Иванов','phone':'89001234567','device':'iPhone','fault':'АКБ','master_id':2,'device_password':'1234-secret'})[1]['id'])
+  self.assertEqual(self.call(a,base)[1]['order']['device_password'],'1234-secret')
+  self.assertNotIn('device_password',self.call(a,'orders')[1][0])
+  self.assertEqual(self.call(a,base+'/items',{'kind':'Работа','name':'Замена АКБ','quantity':1,'price':5500,'warranty':90,'master_id':4})[0],400)
+  self.assertEqual(self.call(a,base+'/items',{'kind':'Работа','name':'Замена АКБ','quantity':1,'price':5500,'warranty':90,'master_id':2})[0],200)
+  self.assertEqual(self.call(a,base+'/items',{'kind':'Работа','name':'Настройка','quantity':1,'price':2000,'warranty':30,'master_id':3})[0],200)
+  self.assertEqual(self.call(two,base)[0],200)
+  self.assertEqual(len(self.call(two,'orders')[1]),1)
+  self.assertEqual(self.call(other,base)[0],403)
+  work=self.call(a,base)[1]['items'][0]['id']
+  sid=self.call(a,'stock',{'branch_id':1,'name':'АКБ','sku':'AKB','quantity':1,'unit_cost':1000})[1]['id']
+  self.assertEqual(self.call(a,base+'/parts',{'item_id':work,'stock_id':sid,'quantity':1})[0],200)
+  self.assertEqual(self.call(a,base+'/status',{'status':'Выдан','version':self.call(a,base)[1]['order']['version']})[0],400)
+  self.call(a,base+'/payments',{'amount':500,'method':'Наличные'})
+  version=self.call(a,base)[1]['order']['version']
+  self.assertEqual(self.call(one,base+'/issue',{'status':'Выдан','method':'Карта','version':version})[0],403)
+  self.assertEqual(self.call(a,base+'/issue',{'status':'Выдан','method':'','version':version})[0],400)
+  with ThreadPoolExecutor(max_workers=2) as pool:
+   results=list(pool.map(lambda _:self.call(a,base+'/issue',{'status':'Выдан','method':'Карта','version':version})[0],range(2)))
+  self.assertEqual(sorted(results),[200,400])
+  detail=self.call(a,base)[1];self.assertEqual(detail['order']['status'],'Выдан');self.assertEqual(sum(p['amount'] for p in detail['payments']),750000);self.assertEqual(len(detail['payments']),2)
+  self.assertEqual(self.call(a,base+'/status',{'status':'Ремонт','version':detail['order']['version']})[0],400)
+  self.assertEqual(self.call(a,base+'/assign-work',{'item_id':work,'master_id':3})[0],400)
+  today=datetime.now(timezone(timedelta(hours=3))).date().isoformat()
+  report=self.call(a,'dashboard?from='+today+'&to='+today)[1]
+  self.assertEqual((report['accepted'],report['issued'],report['revenue'],report['cost'],report['salary'],report['service']),(1,1,750000,100000,260000,390000))
+  shares={p['id']:p['salary'] for p in report['payroll']};self.assertEqual(shares,{2:180000,3:80000})
+  mine=self.call(two,'dashboard?from='+today+'&to='+today)[1];self.assertEqual(mine['salary'],80000);self.assertEqual(len(mine['payroll']),1);self.assertEqual(mine['payroll'][0]['id'],3)
+  self.assertEqual(self.call(other,'dashboard?from='+today+'&to='+today)[1]['issued'],0)
+  self.assertEqual(self.call(other,'dashboard?branch=1')[0],400)
+  self.assertEqual(self.call(a,'dashboard?from=2026-10-26&to=2026-10-25')[0],400)
+  with __import__('sqlite3').connect(self.tmp.name+'/test.sqlite3') as c:
+   c.execute("UPDATE orders SET created='2026-10-24 21:30:00',issued_at='2026-10-25 21:30:00'")
+   c.execute("UPDATE earnings SET issued_at='2026-10-25 21:30:00'")
+  day=self.call(a,'dashboard?from=2026-10-26&to=2026-10-26')[1];self.assertEqual((day['accepted'],day['issued'],day['salary']),(0,1,260000))
+  before=self.call(a,'dashboard?from=2026-10-25&to=2026-10-25')[1];self.assertEqual((before['accepted'],before['issued'],before['salary']),(1,0,0))
+  # Without repair can be free and must still close and remain idempotent.
+  empty='orders/'+str(self.call(a,'orders',{'branch_id':1,'client':'Петров','phone':'+79005556677','device':'ПК','fault':'Отказ'})[1]['id'])
+  self.assertEqual(self.call(a,empty+'/issue',{'status':'Выдан без ремонта','method':'Наличные','version':1})[0],200)
+  self.assertEqual(self.call(a,empty)[1]['payments'],[])
+  self.assertEqual(self.call(a,empty)[1]['order']['status'],'Выдан без ремонта')
 
 if __name__=='__main__':unittest.main(verbosity=2)
