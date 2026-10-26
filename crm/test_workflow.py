@@ -323,4 +323,50 @@ class ExpandedWorkflow(Workflow):
   with a.open(self.url+base+'/print?type=completion') as response:
    document=response.read().decode();self.assertNotIn('5 500',document);self.assertIn('0.00',document)
 
+class DeleteOrderEditStock(Workflow):
+ def test_repair_and_permissions(self):
+  a=self.owner
+  self.call(a,'setup',{'name':'Владелец','email':'owner@example.test','password':'test-password-123','branch':'Центр'})
+  self.call(a,'login',{'email':'owner@example.test','password':'test-password-123'})
+  self.call(a,'branches',{'name':'Другой'})
+  self.call(a,'users',{'name':'Мастер','email':'master@example.test','password':'test-password-123','role':'master','branches':[1]})
+  self.call(a,'users',{'name':'Приёмщик','email':'other@example.test','password':'test-password-123','role':'manager','branches':[2]})
+  master=self.client();other=self.client()
+  self.call(master,'login',{'email':'master@example.test','password':'test-password-123'});self.call(other,'login',{'email':'other@example.test','password':'test-password-123'})
+  order={'branch_id':1,'client':'Иванов','phone':'89001234567','device':'ПК','fault':'Не работает','master_id':2}
+  base='orders/'+str(self.call(a,'orders',order)[1]['id'])
+  groups=self.call(a,'stock-groups',{'name':'Аксессуары'})[1];gid=groups[0]['id']
+  sid=self.call(a,'stock',{'name':'Название до','sku':'BEFORE','branch_id':1,'quantity':5,'unit_cost':1000})[1]['id']
+  payload={'name':'  Новое   название ','sku':'NEW-001','group_id':gid}
+  self.assertEqual(self.call(master,'stock/'+str(sid)+'/edit',payload)[0],403)
+  self.assertEqual(self.call(other,'stock/'+str(sid)+'/edit',payload)[0],403)
+  self.assertEqual(self.call(a,'stock/'+str(sid)+'/edit',{**payload,'name':''})[0],400)
+  self.assertEqual(self.call(a,'stock/'+str(sid)+'/edit',payload)[0],200)
+  stock=self.call(a,'stock')[1][0];self.assertEqual((stock['name'],stock['sku'],stock['group_id'],stock['quantity'],stock['unit_cost']),('Новое название','NEW-001',gid,5,100000))
+  self.call(a,'stock',{'name':'Другая','sku':'EXISTS','branch_id':1,'quantity':1,'unit_cost':50})
+  self.assertEqual(self.call(a,'stock/'+str(sid)+'/edit',{**payload,'sku':'EXISTS'})[0],400)
+  self.assertEqual(next(p for p in self.call(a,'stock')[1] if p['id']==sid)['sku'],'NEW-001')
+  for name in ('Работа А','Работа Б'):self.call(a,base+'/items',{'name':name,'kind':'Работа','quantity':1,'price':5000,'warranty':30,'master_id':2})
+  items=self.call(a,base)[1]['items']
+  for item in items:self.call(a,base+'/parts',{'item_id':item['id'],'stock_id':sid,'quantity':1})
+  version=self.call(a,base)[1]['order']['version']
+  self.call(a,base+'/delete-work',{'item_id':items[0]['id'],'version':version})
+  version=self.call(a,base)[1]['order']['version']
+  self.assertEqual(self.call(master,base+'/delete',{'version':version})[0],403)
+  self.assertEqual(self.call(other,base+'/delete',{'version':version})[0],403)
+  self.assertEqual(self.call(a,base+'/delete',{'version':version-1})[0],400)
+  self.assertEqual(self.call(a,base+'/delete',{'version':version,'reason':'Передумал оставлять устройство'})[0],200)
+  self.assertEqual(self.call(a,base)[0],403);self.assertEqual(self.call(a,'orders')[1],[])
+  self.assertEqual(self.call(a,base+'/delete',{'version':version})[0],403)
+  self.assertEqual(next(p for p in self.call(a,'stock')[1] if p['id']==sid)['quantity'],5)
+  self.assertEqual(self.call(a,'dashboard')[1]['accepted'],0)
+  paid='orders/'+str(self.call(a,'orders',order)[1]['id']);self.call(a,paid+'/payments',{'amount':100,'method':'Карта'})
+  self.assertEqual(self.call(a,paid+'/delete',{'version':1})[0],400)
+  issued='orders/'+str(self.call(a,'orders',order)[1]['id']);self.call(a,issued+'/issue',{'status':'Выдан без ремонта','method':'Без оплаты','version':1})
+  self.assertEqual(self.call(a,issued+'/delete',{'version':2})[0],400)
+  with __import__('sqlite3').connect(self.tmp.name+'/test.sqlite3') as c:
+   self.assertEqual(c.execute('SELECT deleted FROM orders WHERE id=1').fetchone()[0],1)
+   self.assertTrue(c.execute("SELECT text FROM events WHERE order_id=1 AND text LIKE 'Заказ удалён:%'").fetchone())
+   self.assertEqual(c.execute('SELECT sum(quantity) FROM stock_movements WHERE stock_id=?',(sid,)).fetchone()[0],5)
+
 if __name__=='__main__':unittest.main(verbosity=2)

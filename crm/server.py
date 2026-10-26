@@ -20,6 +20,14 @@ def eligible_master(c,uid,branch_id):
   raise ValueError('Мастер не имеет доступа к филиалу')
  return uid
 
+def restore_work_parts(c,item_id,user_id):
+ for part in c.execute('SELECT * FROM item_parts WHERE item_id=?',(item_id,)).fetchall():
+  original=c.execute('SELECT * FROM stock WHERE id=?',(part['stock_id'],)).fetchone()
+  quantity=original['quantity']+part['quantity']
+  cost=(original['quantity']*original['unit_cost']+part['quantity']*part['unit_cost']+quantity//2)//quantity
+  c.execute('UPDATE stock SET quantity=?,unit_cost=? WHERE id=?',(quantity,cost,original['id']))
+  c.execute('INSERT INTO stock_movements(stock_id,user_id,quantity,unit_cost,item_id) VALUES(?,?,?,?,?)',(original['id'],user_id,part['quantity'],part['unit_cost'],item_id))
+
 def connection():
  c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; c.execute('PRAGMA foreign_keys=ON'); return c
 def password(value, salt=None):
@@ -73,7 +81,7 @@ CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY,order_id INTEGER REFEREN
 CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY,order_id INTEGER REFERENCES orders(id),amount INTEGER NOT NULL,method TEXT NOT NULL,created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,order_id INTEGER REFERENCES orders(id),user_id INTEGER REFERENCES users(id),text TEXT NOT NULL,created TEXT DEFAULT CURRENT_TIMESTAMP);
 ''')
-  for table,name,definition in [('catalog','warranty','INTEGER NOT NULL DEFAULT 30'),('catalog','work_group',"TEXT NOT NULL DEFAULT ''"),('catalog','active','INTEGER NOT NULL DEFAULT 1'),('items','deleted','INTEGER NOT NULL DEFAULT 0'),('orders','no_payment','INTEGER NOT NULL DEFAULT 0'),('stock','group_id','INTEGER REFERENCES stock_groups(id)'),('orders','brand',"TEXT NOT NULL DEFAULT ''")]:
+  for table,name,definition in [('catalog','warranty','INTEGER NOT NULL DEFAULT 30'),('catalog','work_group',"TEXT NOT NULL DEFAULT ''"),('catalog','active','INTEGER NOT NULL DEFAULT 1'),('items','deleted','INTEGER NOT NULL DEFAULT 0'),('orders','no_payment','INTEGER NOT NULL DEFAULT 0'),('stock','group_id','INTEGER REFERENCES stock_groups(id)'),('orders','brand',"TEXT NOT NULL DEFAULT ''"),('orders','deleted','INTEGER NOT NULL DEFAULT 0')]:
    if name not in {r['name'] for r in c.execute('PRAGMA table_info('+table+')')}:
     c.execute('ALTER TABLE '+table+' ADD COLUMN '+name+' '+definition)
   c.execute('CREATE TABLE IF NOT EXISTS stock_groups(id INTEGER PRIMARY KEY,name TEXT NOT NULL,normalized TEXT NOT NULL UNIQUE)')
@@ -195,6 +203,14 @@ class Handler(BaseHTTPRequestHandler):
     rows=c.execute('SELECT s.*,b.name branch_name,g.name group_name FROM stock s JOIN branches b ON b.id=s.branch_id LEFT JOIN stock_groups g ON g.id=s.group_id ORDER BY s.name').fetchall()
     self.reply([dict(x) for x in rows if x['branch_id'] in ids]);return
    if u['role']=='master':self.reply({'error':'Поступление запчастей доступно владельцу и приёмщику'},403);return
+   if p.endswith('/edit'):
+    sid=int(p.split('/')[3]);part=c.execute('SELECT * FROM stock WHERE id=?',(sid,)).fetchone()
+    if not part or part['branch_id'] not in ids:self.reply({'error':'Запчасть или товар недоступны'},403);return
+    name=' '.join(str(data.get('name','')).split());sku=str(data.get('sku','')).strip()
+    if not name or not sku or len(name)>300 or len(sku)>100:raise ValueError('Укажите название до 300 символов и артикул до 100 символов')
+    group=int(data['group_id']) if data.get('group_id') else None
+    c.execute('UPDATE stock SET name=?,sku=?,group_id=? WHERE id=?',(name,sku,group,sid))
+    self.reply({'ok':True});return
    if p.endswith('/group'):
     sid=int(p.split('/')[3]);part=c.execute('SELECT * FROM stock WHERE id=?',(sid,)).fetchone()
     if not part or part['branch_id'] not in ids:self.reply({'error':'Запчасть недоступна'},403);return
@@ -251,7 +267,7 @@ class Handler(BaseHTTPRequestHandler):
     for b in data['branches']:c.execute('INSERT INTO access VALUES(?,?)',(uid,int(b)))
    self.reply({'ok':True});return
   if p=='/api/orders' and self.command=='GET':
-   rows=c.execute('SELECT o.*,u.name master_name,b.name branch_name,CASE WHEN o.no_payment=1 THEN 0 ELSE (SELECT coalesce(sum(quantity*price),0) FROM items WHERE order_id=o.id AND deleted=0) END total,(SELECT coalesce(sum(amount),0) FROM payments WHERE order_id=o.id) paid FROM orders o JOIN branches b ON b.id=o.branch_id LEFT JOIN users u ON u.id=o.master_id ORDER BY o.id DESC').fetchall()
+   rows=c.execute('SELECT o.*,u.name master_name,b.name branch_name,CASE WHEN o.no_payment=1 THEN 0 ELSE (SELECT coalesce(sum(quantity*price),0) FROM items WHERE order_id=o.id AND deleted=0) END total,(SELECT coalesce(sum(amount),0) FROM payments WHERE order_id=o.id) paid FROM orders o JOIN branches b ON b.id=o.branch_id LEFT JOIN users u ON u.id=o.master_id WHERE o.deleted=0 ORDER BY o.id DESC').fetchall()
    self.reply([{k:v for k,v in dict(x).items() if k!='device_password'} for x in rows if x['branch_id'] in ids and (u['role']!='master' or x['master_id']==u['id'] or c.execute('SELECT 1 FROM items WHERE order_id=? AND master_id=? AND deleted=0',(x['id'],u['id'])).fetchone())]);return
   if p=='/api/orders' and self.command=='POST':
    if u['role']=='master':self.reply({'error':'Создание доступно приёмщику'},403);return
@@ -270,7 +286,7 @@ class Handler(BaseHTTPRequestHandler):
    oid=c.execute('INSERT INTO orders('+','.join(keys)+',status) VALUES('+','.join('?' for _ in range(15))+')',values+['Новый']).lastrowid;event(oid,'Заказ создан');self.reply({'id':oid});return
   if p.startswith('/api/orders/'):
    parts=p.split('/');oid=int(parts[3]);o=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
-   if not o or o['branch_id'] not in ids or (u['role']=='master' and o['master_id']!=u['id'] and not c.execute('SELECT 1 FROM items WHERE order_id=? AND master_id=? AND deleted=0',(oid,u['id'])).fetchone()):self.reply({'error':'Заказ недоступен'},403);return
+   if not o or o['deleted'] or o['branch_id'] not in ids or (u['role']=='master' and o['master_id']!=u['id'] and not c.execute('SELECT 1 FROM items WHERE order_id=? AND master_id=? AND deleted=0',(oid,u['id'])).fetchone()):self.reply({'error':'Заказ недоступен'},403);return
    if self.command=='GET':
     items=[dict(x) for x in c.execute('SELECT i.*,u.name master_name FROM items i LEFT JOIN users u ON u.id=i.master_id WHERE order_id=? AND i.deleted=0',(oid,))]
     if len(parts)>4 and parts[4]=='print':
@@ -281,7 +297,19 @@ class Handler(BaseHTTPRequestHandler):
     used=[dict(x) for x in c.execute('SELECT ip.*,s.name,s.sku FROM item_parts ip JOIN items i ON i.id=ip.item_id JOIN stock s ON s.id=ip.stock_id WHERE i.order_id=? AND i.deleted=0',(oid,))]
     self.reply({'order':dict(o),'items':items,'parts':used,'payments':[dict(x) for x in c.execute('SELECT * FROM payments WHERE order_id=?',(oid,))],'events':[dict(x) for x in c.execute('SELECT e.*,u.name author FROM events e JOIN users u ON u.id=e.user_id WHERE order_id=? ORDER BY e.id DESC',(oid,))]});return
    action=parts[4]
-   if action=='issue':
+   if action=='delete':
+    if u['role']=='master':self.reply({'error':'Удаление доступно владельцу и приёмщику'},403);return
+    if o['issued_at'] or done_status(o['status']):raise ValueError('Выданный заказ нельзя удалить: в нём сохранена история выдачи и начислений')
+    if c.execute('SELECT 1 FROM payments WHERE order_id=?',(oid,)).fetchone():raise ValueError('Нельзя удалить заказ с платежами: сначала необходимо оформить возврат')
+    if int(data['version'])!=o['version']:raise ValueError('Заказ изменён. Откройте его повторно')
+    reason=str(data.get('reason','Клиент отказался оставлять устройство')).strip()
+    if len(reason)>1000:raise ValueError('Причина удаления: до 1000 символов')
+    for item in c.execute('SELECT id FROM items WHERE order_id=? AND deleted=0',(oid,)).fetchall():
+     restore_work_parts(c,item['id'],u['id'])
+    c.execute('UPDATE items SET deleted=1 WHERE order_id=?',(oid,))
+    c.execute('UPDATE orders SET deleted=1,version=version+1 WHERE id=?',(oid,))
+    event(oid,'Заказ удалён: '+reason+'. Списанные запчасти возвращены на склад.')
+   elif action=='issue':
     if u['role']=='master':self.reply({'error':'Выдача доступна приёмщику'},403);return
     if o['issued_at'] or done_status(o['status']):raise ValueError('Заказ уже закрыт')
     if int(data['version'])!=o['version']:raise ValueError('Заказ изменён. Откройте его повторно')
@@ -307,12 +335,7 @@ class Handler(BaseHTTPRequestHandler):
     if int(data['version'])!=o['version']:raise ValueError('Заказ изменён. Откройте его повторно')
     item=c.execute('SELECT * FROM items WHERE id=? AND order_id=? AND deleted=0',(int(data['item_id']),oid)).fetchone()
     if not item:raise ValueError('Работа не найдена или уже удалена')
-    for part in c.execute('SELECT * FROM item_parts WHERE item_id=?',(item['id'],)).fetchall():
-     original=c.execute('SELECT * FROM stock WHERE id=?',(part['stock_id'],)).fetchone()
-     quantity=original['quantity']+part['quantity']
-     cost=(original['quantity']*original['unit_cost']+part['quantity']*part['unit_cost']+quantity//2)//quantity
-     c.execute('UPDATE stock SET quantity=?,unit_cost=? WHERE id=?',(quantity,cost,original['id']))
-     c.execute('INSERT INTO stock_movements(stock_id,user_id,quantity,unit_cost,item_id) VALUES(?,?,?,?,?)',(original['id'],u['id'],part['quantity'],part['unit_cost'],item['id']))
+    restore_work_parts(c,item['id'],u['id'])
     c.execute('UPDATE items SET deleted=1 WHERE id=?',(item['id'],))
     c.execute('UPDATE orders SET version=version+1 WHERE id=?',(oid,))
     event(oid,'Удалена работа «'+item['name']+'». Связанные запчасти возвращены на склад.')

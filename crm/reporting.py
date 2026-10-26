@@ -20,7 +20,7 @@ def dashboard(c,user,branch_ids,query):
   branch_ids=[int(bid)]
  lower=(datetime.combine(start,datetime.min.time())-timedelta(hours=3)).isoformat(' ')
  upper=(datetime.combine(end+timedelta(days=1),datetime.min.time())-timedelta(hours=3)).isoformat(' ')
- allowed={o['id']:o for o in c.execute('SELECT id,branch_id,master_id,created,issued_at,status FROM orders') if o['branch_id'] in branch_ids and (user['role']!='master' or o['master_id']==user['id'] or c.execute('SELECT 1 FROM items WHERE order_id=? AND master_id=? AND deleted=0',(o['id'],user['id'])).fetchone())}
+ allowed={o['id']:o for o in c.execute('SELECT id,branch_id,master_id,created,issued_at,status FROM orders WHERE deleted=0') if o['branch_id'] in branch_ids and (user['role']!='master' or o['master_id']==user['id'] or c.execute('SELECT 1 FROM items WHERE order_id=? AND master_id=? AND deleted=0',(o['id'],user['id'])).fetchone())}
  accepted=sum(lower<=o['created']<upper for o in allowed.values())
  issued=sum(bool(o['issued_at']) and lower<=o['issued_at']<upper for o in allowed.values())
  payroll={};revenue=cost=master_total=service=0
