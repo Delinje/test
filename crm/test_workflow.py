@@ -19,6 +19,8 @@ class Workflow(unittest.TestCase):
  def client():return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
  @classmethod
  def call(cls,client,path,data=None):
+  if path=='orders' and data is not None:
+   data={'serial':'TEST-SERIAL','appearance':'Царапины','device_password':'нет','equipment':'нет',**data}
   req=urllib.request.Request(cls.url+path,data=json.dumps(data).encode() if data is not None else None,headers={'Content-Type':'application/json'})
   try:
    with client.open(req) as r:return r.status,json.load(r)
@@ -81,7 +83,7 @@ class ClientCatalogWorkflow(Workflow):
   self.assertEqual(self.call(a,'orders',{**order,'phone':'8 900 123 45 67'})[0],200)
   self.assertEqual(len(self.call(a,'clients?q=900123')[1]),1)
   catalog=self.call(a,'catalog')[1]
-  self.assertEqual(len(catalog),5)
+  self.assertEqual(len(catalog),6)
   self.assertEqual({x['value'] for x in catalog if x['kind']=='appearance'},{'Царапины','Потёртости'})
   master=self.client();self.call(master,'login',{'email':'master@example.test','password':'test-password-123'})
   self.assertEqual(self.call(master,'clients?q=900123')[0],403)
@@ -95,7 +97,7 @@ class ClientCatalogWorkflow(Workflow):
    try:self.call(a,'setup');break
    except OSError:time.sleep(.05)
   self.assertEqual(len(self.call(a,'clients?q=900123')[1]),1)
-  self.assertEqual(len(self.call(a,'catalog')[1]),5)
+  self.assertEqual(len(self.call(a,'catalog')[1]),6)
 
 class Migration(unittest.TestCase):
  def test_existing_orders_backfilled_without_changes(self):
@@ -112,7 +114,7 @@ class Migration(unittest.TestCase):
    with module.connection() as c:
     self.assertEqual(tuple(c.execute('SELECT * FROM orders').fetchone()),before)
     self.assertEqual(c.execute('SELECT normalized_phone FROM clients').fetchone()[0],'79005556677')
-    self.assertEqual(c.execute('SELECT count(*) FROM catalog').fetchone()[0],3)
+    self.assertEqual(c.execute('SELECT count(*) FROM catalog WHERE kind!="work"').fetchone()[0],3)
 
 class UpgradeMigration(unittest.TestCase):
  def test_diagnosis_added_to_previous_database(self):
@@ -130,7 +132,7 @@ class UpgradeMigration(unittest.TestCase):
    module.initialize();module.initialize()
    with module.connection() as c:
     after=dict(c.execute('SELECT * FROM orders').fetchone());self.assertEqual(after.pop('diagnosis'),'');self.assertEqual(before,after)
-    self.assertEqual(c.execute("SELECT count(*) FROM catalog WHERE kind='work'").fetchone()[0],1)
+    self.assertEqual(c.execute("SELECT count(*) FROM catalog WHERE kind='work' AND value='Ремонт питания'").fetchone()[0],1)
     self.assertEqual(c.execute('SELECT price FROM items').fetchone()[0],500000)
 
 class StockDocumentsWorkflow(Workflow):
@@ -152,7 +154,7 @@ class StockDocumentsWorkflow(Workflow):
   self.assertEqual(self.call(master,'works',{'value':'Ремонт питания'})[0],200)
   self.assertEqual(self.call(a,base+'/items',{'name':'Ремонт питания','kind':'Работа','price':'5500.25','quantity':1,'warranty':90})[0],200)
   self.assertEqual(self.call(a,base+'/items',{'name':'Старый материал','kind':'Материал','price':'100','quantity':1,'warranty':0})[0],200)
-  self.assertEqual(len(self.call(a,'works')[1]),1)
+  self.assertEqual(len([w for w in self.call(a,'works')[1] if w['value']=='Ремонт питания']),1)
   work=self.call(a,base)[1]['items'][0]['id']
   payload={'branch_id':1,'name':'Секретная запчасть <script>','sku':'AKB-13','quantity':2,'unit_cost':'1000.10'}
   self.assertEqual(self.call(master,'stock',payload)[0],403)
@@ -253,7 +255,7 @@ class PayrollWorkflow(Workflow):
    results=list(pool.map(lambda _:self.call(a,base+'/issue',{'status':'Выдан','method':'Карта','version':version})[0],range(2)))
   self.assertEqual(sorted(results),[200,400])
   detail=self.call(a,base)[1];self.assertEqual(detail['order']['status'],'Выдан');self.assertEqual(sum(p['amount'] for p in detail['payments']),750000);self.assertEqual(len(detail['payments']),2)
-  self.assertEqual(self.call(a,base+'/status',{'status':'Ремонт','version':detail['order']['version']})[0],400)
+  self.assertEqual(self.call(a,base+'/status',{'status':'Ремонт','version':detail['order']['version']})[0],200)
   self.assertEqual(self.call(a,base+'/assign-work',{'item_id':work,'master_id':3})[0],400)
   today=datetime.now(timezone(timedelta(hours=3))).date().isoformat()
   report=self.call(a,'dashboard?from='+today+'&to='+today)[1]
@@ -273,5 +275,52 @@ class PayrollWorkflow(Workflow):
   self.assertEqual(self.call(a,empty+'/issue',{'status':'Выдан без ремонта','method':'Наличные','version':1})[0],200)
   self.assertEqual(self.call(a,empty)[1]['payments'],[])
   self.assertEqual(self.call(a,empty)[1]['order']['status'],'Выдан без ремонта')
+
+class ExpandedWorkflow(Workflow):
+ def test_repair_and_permissions(self):
+  a=self.owner
+  self.call(a,'setup',{'name':'Владелец','email':'owner@example.test','password':'test-password-123','branch':'Центр'})
+  self.call(a,'login',{'email':'owner@example.test','password':'test-password-123'})
+  order={'branch_id':1,'client':'Иванов','phone':'89001234567','device':'iPhone 13','serial':'SERIAL','appearance':'Царапины','device_password':'1234','equipment':'Чехол','fault':'АКБ'}
+  for key in ['client','phone','device','serial','appearance','device_password','equipment','fault']:
+   self.assertEqual(self.call(a,'orders',{**order,key:''})[0],400,key)
+  works=self.call(a,'works')[1];self.assertGreaterEqual(len(works),55);self.assertTrue(all(w['warranty']==30 for w in works))
+  chosen=next(w for w in works if w['value']=='Замена аккумулятора')
+  self.assertEqual(self.call(a,'works',{'id':chosen['id'],'value':'Замена аккумулятора','warranty':60,'work_group':'Телефоны'})[0],200)
+  self.assertEqual(next(w for w in self.call(a,'works')[1] if w['id']==chosen['id'])['warranty'],60)
+  base='orders/'+str(self.call(a,'orders',order)[1]['id'])
+  self.assertEqual(self.call(a,base+'/items',{'name':'Замена аккумулятора','kind':'Работа','quantity':1,'price':5500,'warranty':30,'master_id':1})[0],200)
+  self.assertEqual(self.call(a,base)[1]['items'][0]['warranty'],30)
+  group=self.call(a,'stock-groups',{'name':'Аккумуляторы'})[1][0]
+  self.assertEqual(len(self.call(a,'stock-groups',{'name':'  АККУМУЛЯТОРЫ '})[1]),1)
+  sid=self.call(a,'stock',{'name':'АКБ','sku':'BAT','quantity':3,'unit_cost':500,'branch_id':1,'group_id':group['id']})[1]['id']
+  self.assertEqual(self.call(a,'stock')[1][0]['group_name'],'Аккумуляторы')
+  self.assertEqual(self.call(a,'stock/'+str(sid)+'/group',{'group_id':''})[0],200)
+  self.assertIsNone(self.call(a,'stock')[1][0]['group_id'])
+  self.assertEqual(self.call(a,'stock/'+str(sid)+'/group',{'group_id':group['id']})[0],200)
+  item=self.call(a,base)[1]['items'][0]['id']
+  self.call(a,base+'/parts',{'item_id':item,'stock_id':sid,'quantity':2})
+  version=self.call(a,base)[1]['order']['version']
+  self.assertEqual(self.call(a,base+'/delete-work',{'item_id':item,'version':version-1})[0],400)
+  self.assertEqual(self.call(a,base+'/delete-work',{'item_id':item,'version':version})[0],200)
+  self.assertEqual(self.call(a,base)[1]['items'],[]);self.assertEqual(self.call(a,base)[1]['parts'],[]);self.assertEqual(self.call(a,'stock')[1][0]['quantity'],3)
+  self.assertEqual(self.call(a,base+'/delete-work',{'item_id':item,'version':version+1})[0],400)
+  self.call(a,base+'/items',{'name':'Замена аккумулятора','kind':'Работа','quantity':1,'price':5500,'warranty':30,'master_id':1})
+  item=self.call(a,base)[1]['items'][0]['id'];self.call(a,base+'/parts',{'item_id':item,'stock_id':sid,'quantity':1})
+  version=self.call(a,base)[1]['order']['version']
+  self.assertEqual(self.call(a,base+'/issue',{'status':'Выдан','method':'Без оплаты','version':version})[0],200)
+  detail=self.call(a,base)[1];self.assertEqual(detail['payments'],[]);self.assertEqual(detail['order']['no_payment'],1);self.assertEqual(self.call(a,'orders')[1][0]['total'],0)
+  issued=detail['order']['issued_at']
+  self.assertEqual(self.call(a,base+'/status',{'status':'Ремонт','version':detail['order']['version']})[0],200)
+  self.assertEqual(self.call(a,base+'/issue',{'status':'Выдан','method':'Карта','version':detail['order']['version']+1})[0],400)
+  self.assertEqual(self.call(a,base+'/delete-work',{'item_id':item,'version':detail['order']['version']+1})[0],400)
+  self.assertEqual(self.call(a,base+'/status',{'status':'Выдан без ремонта','version':detail['order']['version']+1})[0],200)
+  self.assertEqual(self.call(a,base)[1]['order']['issued_at'],issued)
+  with __import__('sqlite3').connect(self.tmp.name+'/test.sqlite3') as c:
+   self.assertEqual(c.execute('SELECT count(*) FROM earnings').fetchone()[0],1)
+   self.assertEqual(c.execute('SELECT revenue,cost,master_share,service_share FROM earnings').fetchone(),(0,50000,0,-50000))
+   self.assertEqual(c.execute('SELECT sum(quantity) FROM stock_movements WHERE stock_id=?',(sid,)).fetchone()[0],2)
+  with a.open(self.url+base+'/print?type=completion') as response:
+   document=response.read().decode();self.assertNotIn('5 500',document);self.assertIn('0.00',document)
 
 if __name__=='__main__':unittest.main(verbosity=2)

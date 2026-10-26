@@ -5,6 +5,7 @@ from http.cookies import SimpleCookie
 from urllib.parse import urlsplit, parse_qs
 from documents import render_document
 from reporting import dashboard, accrue_salary
+from work_defaults import DEFAULT_WORKS
 
 ROOT = Path(__file__).parent
 DB = os.environ.get('CRM_DB', str(ROOT / 'data.sqlite3'))
@@ -44,7 +45,7 @@ def positive_int(value):
 
 def save_catalog(c,kind,value):
  value=' '.join(str(value).split())
- if kind not in ('device','appearance','fault','work') or not value or len(value)>300:
+ if kind not in ('device','appearance','fault','work','brand','equipment') or not value or len(value)>300:
   raise ValueError('Укажите вариант длиной до 300 символов')
  c.execute('INSERT OR IGNORE INTO catalog(kind,value,normalized) VALUES(?,?,?)',(kind,value,value.casefold()))
 
@@ -72,6 +73,16 @@ CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY,order_id INTEGER REFEREN
 CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY,order_id INTEGER REFERENCES orders(id),amount INTEGER NOT NULL,method TEXT NOT NULL,created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,order_id INTEGER REFERENCES orders(id),user_id INTEGER REFERENCES users(id),text TEXT NOT NULL,created TEXT DEFAULT CURRENT_TIMESTAMP);
 ''')
+  for table,name,definition in [('catalog','warranty','INTEGER NOT NULL DEFAULT 30'),('catalog','work_group',"TEXT NOT NULL DEFAULT ''"),('catalog','active','INTEGER NOT NULL DEFAULT 1'),('items','deleted','INTEGER NOT NULL DEFAULT 0'),('orders','no_payment','INTEGER NOT NULL DEFAULT 0'),('stock','group_id','INTEGER REFERENCES stock_groups(id)'),('orders','brand',"TEXT NOT NULL DEFAULT ''")]:
+   if name not in {r['name'] for r in c.execute('PRAGMA table_info('+table+')')}:
+    c.execute('ALTER TABLE '+table+' ADD COLUMN '+name+' '+definition)
+  c.execute('CREATE TABLE IF NOT EXISTS stock_groups(id INTEGER PRIMARY KEY,name TEXT NOT NULL,normalized TEXT NOT NULL UNIQUE)')
+  if not c.execute("SELECT 1 FROM migrations WHERE name='starter_works_v1'").fetchone():
+   for group,names in DEFAULT_WORKS.items():
+    for name in names:
+     save_catalog(c,'work',name)
+     c.execute("UPDATE catalog SET work_group=? WHERE kind='work' AND normalized=? AND work_group=''",(group,name.casefold()))
+   c.execute("INSERT INTO migrations VALUES('starter_works_v1')")
   if not c.execute("SELECT 1 FROM migrations WHERE name='client_catalog_v1'").fetchone():
    for o in c.execute('SELECT * FROM orders ORDER BY id').fetchall():
     digits=normalize_phone(o['phone'])
@@ -162,13 +173,33 @@ class Handler(BaseHTTPRequestHandler):
   if p=='/api/dashboard':
    self.reply(dashboard(c,u,ids,query));return
   if p=='/api/works':
-   if self.command=='POST':save_catalog(c,'work',data['value'])
-   self.reply([dict(x) for x in c.execute("SELECT id,value FROM catalog WHERE kind='work' ORDER BY id")]);return
+   if self.command=='POST':
+    value=' '.join(data['value'].split());warranty=int(data.get('warranty',30));group=str(data.get('work_group','')).strip()
+    if not value or len(value)>300 or not 0<=warranty<=3650:raise ValueError('Проверьте название и гарантию (0–3650 дней)')
+    if data.get('id'):
+     if u['role']=='master':self.reply({'error':'Редактирование справочника доступно приёмщику и владельцу'},403);return
+     if not c.execute("UPDATE catalog SET value=?,normalized=?,warranty=?,work_group=?,active=? WHERE id=? AND kind='work'",(value,value.casefold(),warranty,group,0 if data.get('archived') else 1,int(data['id']))).rowcount:raise ValueError('Работа не найдена')
+    else:
+     save_catalog(c,'work',value)
+     c.execute("UPDATE catalog SET warranty=?,work_group=? WHERE kind='work' AND normalized=?",(warranty,group,value.casefold()))
+   self.reply([dict(x) for x in c.execute("SELECT id,value,warranty,work_group,active FROM catalog WHERE kind='work' ORDER BY value")]);return
+  if p=='/api/stock-groups':
+   if self.command=='POST':
+    if u['role']=='master':self.reply({'error':'Нет прав на добавление групп'},403);return
+    name=' '.join(data['name'].split())
+    if not name or len(name)>100:raise ValueError('Укажите название группы до 100 символов')
+    c.execute('INSERT OR IGNORE INTO stock_groups(name,normalized) VALUES(?,?)',(name,name.casefold()))
+   self.reply([dict(x) for x in c.execute('SELECT * FROM stock_groups ORDER BY name')]);return
   if p=='/api/stock' or p.startswith('/api/stock/'):
    if self.command=='GET':
-    rows=c.execute('SELECT s.*,b.name branch_name FROM stock s JOIN branches b ON b.id=s.branch_id ORDER BY s.name').fetchall()
+    rows=c.execute('SELECT s.*,b.name branch_name,g.name group_name FROM stock s JOIN branches b ON b.id=s.branch_id LEFT JOIN stock_groups g ON g.id=s.group_id ORDER BY s.name').fetchall()
     self.reply([dict(x) for x in rows if x['branch_id'] in ids]);return
    if u['role']=='master':self.reply({'error':'Поступление запчастей доступно владельцу и приёмщику'},403);return
+   if p.endswith('/group'):
+    sid=int(p.split('/')[3]);part=c.execute('SELECT * FROM stock WHERE id=?',(sid,)).fetchone()
+    if not part or part['branch_id'] not in ids:self.reply({'error':'Запчасть недоступна'},403);return
+    group=int(data['group_id']) if data.get('group_id') else None
+    c.execute('UPDATE stock SET group_id=? WHERE id=?',(group,sid));self.reply({'ok':True});return
    qty=positive_int(data['quantity']);cost=money(data['unit_cost'])
    if cost<0:raise ValueError('Закупочная цена не может быть отрицательной')
    if p=='/api/stock':
@@ -176,7 +207,8 @@ class Handler(BaseHTTPRequestHandler):
     if bid not in ids:self.reply({'error':'Нет доступа к филиалу'},403);return
     name=' '.join(data['name'].split());sku=data['sku'].strip()
     if not name or not sku or len(name)>300 or len(sku)>100:raise ValueError('Укажите название и артикул запчасти')
-    sid=c.execute('INSERT INTO stock(branch_id,name,sku,quantity,unit_cost) VALUES(?,?,?,?,?)',(bid,name,sku,qty,cost)).lastrowid
+    group=int(data['group_id']) if data.get('group_id') else None
+    sid=c.execute('INSERT INTO stock(branch_id,name,sku,quantity,unit_cost,group_id) VALUES(?,?,?,?,?,?)',(bid,name,sku,qty,cost,group)).lastrowid
    else:
     sid=int(p.split('/')[3]);part=c.execute('SELECT * FROM stock WHERE id=?',(sid,)).fetchone()
     if not part or part['branch_id'] not in ids:self.reply({'error':'Запчасть недоступна'},403);return
@@ -190,7 +222,7 @@ class Handler(BaseHTTPRequestHandler):
    if p=='/api/catalog':
     if self.command=='POST':
      save_catalog(c,data['kind'],data['value'])
-    self.reply([dict(x) for x in c.execute('SELECT id,kind,value FROM catalog ORDER BY id')]);return
+    self.reply([dict(x) for x in c.execute("SELECT id,kind,value FROM catalog WHERE kind!='work' ORDER BY id")]);return
    if self.command!='GET':self.reply({'error':'Метод не поддерживается'},405);return
    term=' '.join(query.get('q',[''])[0].split()).casefold()
    if len(term)<2:self.reply([]);return
@@ -219,47 +251,50 @@ class Handler(BaseHTTPRequestHandler):
     for b in data['branches']:c.execute('INSERT INTO access VALUES(?,?)',(uid,int(b)))
    self.reply({'ok':True});return
   if p=='/api/orders' and self.command=='GET':
-   rows=c.execute('SELECT o.*,u.name master_name,b.name branch_name,(SELECT coalesce(sum(quantity*price),0) FROM items WHERE order_id=o.id) total,(SELECT coalesce(sum(amount),0) FROM payments WHERE order_id=o.id) paid FROM orders o JOIN branches b ON b.id=o.branch_id LEFT JOIN users u ON u.id=o.master_id ORDER BY o.id DESC').fetchall()
-   self.reply([{k:v for k,v in dict(x).items() if k!='device_password'} for x in rows if x['branch_id'] in ids and (u['role']!='master' or x['master_id']==u['id'] or c.execute('SELECT 1 FROM items WHERE order_id=? AND master_id=?',(x['id'],u['id'])).fetchone())]);return
+   rows=c.execute('SELECT o.*,u.name master_name,b.name branch_name,CASE WHEN o.no_payment=1 THEN 0 ELSE (SELECT coalesce(sum(quantity*price),0) FROM items WHERE order_id=o.id AND deleted=0) END total,(SELECT coalesce(sum(amount),0) FROM payments WHERE order_id=o.id) paid FROM orders o JOIN branches b ON b.id=o.branch_id LEFT JOIN users u ON u.id=o.master_id ORDER BY o.id DESC').fetchall()
+   self.reply([{k:v for k,v in dict(x).items() if k!='device_password'} for x in rows if x['branch_id'] in ids and (u['role']!='master' or x['master_id']==u['id'] or c.execute('SELECT 1 FROM items WHERE order_id=? AND master_id=? AND deleted=0',(x['id'],u['id'])).fetchone())]);return
   if p=='/api/orders' and self.command=='POST':
    if u['role']=='master':self.reply({'error':'Создание доступно приёмщику'},403);return
    if int(data['branch_id']) not in ids:self.reply({'error':'Нет доступа к филиалу'},403);return
-   for key in ('client','phone','device','fault'):
-    if not str(data.get(key,'')).strip():raise ValueError('Заполните клиента, телефон, устройство и неисправность')
+   for key in ('client','phone','device','serial','appearance','device_password','equipment','fault'):
+    if not str(data.get(key,'')).strip():raise ValueError('Обязательны ФИО, телефон, модель, IMEI/серийный номер, внешний вид, пароль, комплектация и неисправность. Если пароля или комплектации нет, укажите «нет».')
    master=int(data['master_id']) if data.get('master_id') else None
    if master and not c.execute("SELECT 1 FROM users WHERE id=? AND active=1 AND (role='owner' OR EXISTS(SELECT 1 FROM access WHERE user_id=users.id AND branch_id=?))",(master,int(data['branch_id']))).fetchone():raise ValueError('Мастер не имеет доступа к филиалу')
-   keys=['branch_id','client','phone','device','serial','appearance','equipment','fault','comment','master_id','deadline','estimate','device_password']
+   keys=['branch_id','client','phone','device','serial','appearance','equipment','fault','comment','master_id','deadline','estimate','device_password','brand']
    values=[data.get(k,'') for k in keys];values[0]=int(data['branch_id']);values[2]=format_phone(data['phone']);values[9]=master;values[11]=money(data.get('estimate',0))
    # Save the reusable values and client in the same transaction as the order.
    save_client(c,data['client'],data['phone'])
-   for kind in ('device','appearance','fault'):
+   for kind in ('device','appearance','fault','brand','equipment'):
     for value in str(data.get(kind,'')).split(';'):
      if value.strip():save_catalog(c,kind,value)
-   oid=c.execute('INSERT INTO orders('+','.join(keys)+',status) VALUES('+','.join('?' for _ in range(14))+')',values+['Новый']).lastrowid;event(oid,'Заказ создан');self.reply({'id':oid});return
+   oid=c.execute('INSERT INTO orders('+','.join(keys)+',status) VALUES('+','.join('?' for _ in range(15))+')',values+['Новый']).lastrowid;event(oid,'Заказ создан');self.reply({'id':oid});return
   if p.startswith('/api/orders/'):
    parts=p.split('/');oid=int(parts[3]);o=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
-   if not o or o['branch_id'] not in ids or (u['role']=='master' and o['master_id']!=u['id'] and not c.execute('SELECT 1 FROM items WHERE order_id=? AND master_id=?',(oid,u['id'])).fetchone()):self.reply({'error':'Заказ недоступен'},403);return
+   if not o or o['branch_id'] not in ids or (u['role']=='master' and o['master_id']!=u['id'] and not c.execute('SELECT 1 FROM items WHERE order_id=? AND master_id=? AND deleted=0',(oid,u['id'])).fetchone()):self.reply({'error':'Заказ недоступен'},403);return
    if self.command=='GET':
-    items=[dict(x) for x in c.execute('SELECT i.*,u.name master_name FROM items i LEFT JOIN users u ON u.id=i.master_id WHERE order_id=?',(oid,))]
+    items=[dict(x) for x in c.execute('SELECT i.*,u.name master_name FROM items i LEFT JOIN users u ON u.id=i.master_id WHERE order_id=? AND i.deleted=0',(oid,))]
     if len(parts)>4 and parts[4]=='print':
      kind=query.get('type',[''])[0]
      branch_name=c.execute('SELECT name FROM branches WHERE id=?',(o['branch_id'],)).fetchone()[0]
      body=render_document(kind,dict(o),items,branch_name).encode()
      self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(body);return
-    used=[dict(x) for x in c.execute('SELECT ip.*,s.name,s.sku FROM item_parts ip JOIN items i ON i.id=ip.item_id JOIN stock s ON s.id=ip.stock_id WHERE i.order_id=?',(oid,))]
+    used=[dict(x) for x in c.execute('SELECT ip.*,s.name,s.sku FROM item_parts ip JOIN items i ON i.id=ip.item_id JOIN stock s ON s.id=ip.stock_id WHERE i.order_id=? AND i.deleted=0',(oid,))]
     self.reply({'order':dict(o),'items':items,'parts':used,'payments':[dict(x) for x in c.execute('SELECT * FROM payments WHERE order_id=?',(oid,))],'events':[dict(x) for x in c.execute('SELECT e.*,u.name author FROM events e JOIN users u ON u.id=e.user_id WHERE order_id=? ORDER BY e.id DESC',(oid,))]});return
    action=parts[4]
    if action=='issue':
     if u['role']=='master':self.reply({'error':'Выдача доступна приёмщику'},403);return
-    if done_status(o['status']):raise ValueError('Заказ уже закрыт')
+    if o['issued_at'] or done_status(o['status']):raise ValueError('Заказ уже закрыт')
     if int(data['version'])!=o['version']:raise ValueError('Заказ изменён. Откройте его повторно')
-    if data['status'] not in ('Выдан','Выдан без ремонта') or data['method'] not in ('Наличные','Карта','Перевод'):
+    if data['status'] not in ('Выдан','Выдан без ремонта') or data['method'] not in ('Наличные','Карта','Перевод','Без оплаты'):
      raise ValueError('Выберите способ оплаты и тип выдачи')
-    if c.execute("SELECT 1 FROM items WHERE order_id=? AND kind='Работа' AND master_id IS NULL",(oid,)).fetchone():
+    if c.execute("SELECT 1 FROM items WHERE order_id=? AND deleted=0 AND kind='Работа' AND master_id IS NULL",(oid,)).fetchone():
      raise ValueError('Назначьте мастера каждой работе перед выдачей')
-    total=c.execute('SELECT coalesce(sum(quantity*price),0) FROM items WHERE order_id=?',(oid,)).fetchone()[0]
+    total=c.execute('SELECT coalesce(sum(quantity*price),0) FROM items WHERE order_id=? AND deleted=0',(oid,)).fetchone()[0]
     paid=c.execute('SELECT coalesce(sum(amount),0) FROM payments WHERE order_id=?',(oid,)).fetchone()[0]
-    due=max(0,total-paid)
+    free=data['method']=='Без оплаты'
+    if free and paid:raise ValueError('В заказе уже есть платежи. Бесплатная выдача требует отдельного возврата ранее внесённых денег.')
+    if free:c.execute('UPDATE orders SET no_payment=1 WHERE id=?',(oid,))
+    due=0 if free else max(0,total-paid)
     if due:
      c.execute('INSERT INTO payments(order_id,amount,method) VALUES(?,?,?)',(oid,due,data['method']))
      event(oid,'Оплата при выдаче: '+format(due/100,'.2f')+' ₽, '+data['method'])
@@ -267,23 +302,37 @@ class Handler(BaseHTTPRequestHandler):
     timestamp=c.execute('SELECT issued_at FROM orders WHERE id=?',(oid,)).fetchone()[0]
     accrue_salary(c,oid,timestamp)
     event(oid,o['status']+' → '+data['status']+' · '+data['method'])
+   elif action=='delete-work':
+    if o['issued_at'] or done_status(o['status']):raise ValueError('Нельзя удалять работы после финансового закрытия заказа')
+    if int(data['version'])!=o['version']:raise ValueError('Заказ изменён. Откройте его повторно')
+    item=c.execute('SELECT * FROM items WHERE id=? AND order_id=? AND deleted=0',(int(data['item_id']),oid)).fetchone()
+    if not item:raise ValueError('Работа не найдена или уже удалена')
+    for part in c.execute('SELECT * FROM item_parts WHERE item_id=?',(item['id'],)).fetchall():
+     original=c.execute('SELECT * FROM stock WHERE id=?',(part['stock_id'],)).fetchone()
+     quantity=original['quantity']+part['quantity']
+     cost=(original['quantity']*original['unit_cost']+part['quantity']*part['unit_cost']+quantity//2)//quantity
+     c.execute('UPDATE stock SET quantity=?,unit_cost=? WHERE id=?',(quantity,cost,original['id']))
+     c.execute('INSERT INTO stock_movements(stock_id,user_id,quantity,unit_cost,item_id) VALUES(?,?,?,?,?)',(original['id'],u['id'],part['quantity'],part['unit_cost'],item['id']))
+    c.execute('UPDATE items SET deleted=1 WHERE id=?',(item['id'],))
+    c.execute('UPDATE orders SET version=version+1 WHERE id=?',(oid,))
+    event(oid,'Удалена работа «'+item['name']+'». Связанные запчасти возвращены на склад.')
    elif action=='assign-work':
-    if done_status(o['status']):raise ValueError('Выданный заказ нельзя менять')
+    if o['issued_at'] or done_status(o['status']):raise ValueError('Выданный заказ нельзя менять')
     master=eligible_master(c,data['master_id'],o['branch_id'])
-    if not c.execute("UPDATE items SET master_id=? WHERE id=? AND order_id=? AND kind='Работа'",(master,int(data['item_id']),oid)).rowcount:
+    if not c.execute("UPDATE items SET master_id=? WHERE id=? AND order_id=? AND kind='Работа' AND deleted=0",(master,int(data['item_id']),oid)).rowcount:
      raise ValueError('Работа не найдена')
     event(oid,'Изменён мастер работы')
     c.execute('UPDATE orders SET version=version+1 WHERE id=?',(oid,))
    elif action=='diagnosis':
-    if done_status(o['status']):raise ValueError('Выданный заказ нельзя менять')
+    if o['issued_at'] or done_status(o['status']):raise ValueError('Выданный заказ нельзя менять')
     text=data['text'].strip()
     if len(text)>10000:raise ValueError('Заключение не должно превышать 10 000 символов')
     changed=c.execute('UPDATE orders SET diagnosis=?,version=version+1 WHERE id=? AND version=?',(text,oid,data['version'])).rowcount
     if not changed:raise ValueError('Заказ изменён другим сотрудником. Откройте его повторно')
     event(oid,'Сохранено заключение диагностики')
    elif action=='parts':
-    if done_status(o['status']):raise ValueError('Заказ уже закрыт')
-    work=c.execute("SELECT * FROM items WHERE id=? AND order_id=? AND kind='Работа'",(int(data['item_id']),oid)).fetchone()
+    if o['issued_at'] or done_status(o['status']):raise ValueError('Заказ уже закрыт')
+    work=c.execute("SELECT * FROM items WHERE id=? AND order_id=? AND kind='Работа' AND deleted=0",(int(data['item_id']),oid)).fetchone()
     if not work:raise ValueError('Выберите работу этого заказа')
     part=c.execute('SELECT * FROM stock WHERE id=? AND branch_id=?',(int(data['stock_id']),o['branch_id'])).fetchone()
     if not part:raise ValueError('Выберите запчасть из филиала заказа')
@@ -296,8 +345,8 @@ class Handler(BaseHTTPRequestHandler):
     event(oid,'К работе «'+work['name']+'» списана запчасть «'+part['name']+'», '+str(qty)+' шт.')
    elif action=='status':
     if data['status'] not in STATUSES:raise ValueError('Неизвестный статус')
-    if done_status(o['status']):raise ValueError('Выданный заказ нельзя менять')
-    if done_status(data['status']):raise ValueError('Для закрытия заказа используйте кнопку выдачи')
+    if o['issued_at'] and u['role']=='master':self.reply({'error':'Смена статуса выданного заказа доступна приёмщику'},403);return
+    if not o['issued_at'] and done_status(data['status']):raise ValueError('Для закрытия заказа используйте кнопку выдачи')
     changed=c.execute('UPDATE orders SET status=?,version=version+1 WHERE id=? AND version=?',(data['status'],oid,data['version'])).rowcount
     if not changed:raise ValueError('Заказ изменён другим сотрудником. Откройте его повторно')
     event(oid,o['status']+' → '+data['status'])
@@ -305,7 +354,7 @@ class Handler(BaseHTTPRequestHandler):
     if not data['text'].strip():raise ValueError('Пустой комментарий')
     event(oid,data['text'].strip())
    elif action=='items':
-    if done_status(o['status']):raise ValueError('Заказ уже закрыт')
+    if o['issued_at'] or done_status(o['status']):raise ValueError('Заказ уже закрыт')
     quantity=positive_int(data['quantity']);price=money(data['price']);warranty=int(data.get('warranty',0))
     if quantity<1 or price<0 or warranty<0 or not data['name'].strip() or data['kind'] not in ('Работа','Материал'):raise ValueError('Проверьте позицию')
     master=eligible_master(c,data.get('master_id') or o['master_id'],o['branch_id']) if data['kind']=='Работа' else None
@@ -313,7 +362,7 @@ class Handler(BaseHTTPRequestHandler):
     c.execute('INSERT INTO items(order_id,name,kind,quantity,price,warranty,master_id) VALUES(?,?,?,?,?,?,?)',(oid,data['name'],data['kind'],quantity,price,warranty,master));event(oid,'Добавлено: '+data['name'])
     c.execute('UPDATE orders SET version=version+1 WHERE id=?',(oid,))
    elif action=='payments':
-    if done_status(o['status']):raise ValueError('Заказ уже закрыт')
+    if o['issued_at'] or done_status(o['status']):raise ValueError('Заказ уже закрыт')
     if u['role']=='master':self.reply({'error':'Приём оплаты доступен приёмщику'},403);return
     amount=money(data['amount'])
     if amount<=0 or data['method'] not in ('Наличные','Карта','Перевод'):raise ValueError('Проверьте оплату')

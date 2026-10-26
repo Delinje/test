@@ -23,7 +23,7 @@ def render_document(kind, order, items, branch):
   content=shared+line('Заявленная неисправность',order['fault'])+'<h2>Заключение диагностики</h2><div class="conclusion">'+e(order['diagnosis'])+'</div>'
   signature='Заключение выдал / получил'
  else:
-  works=[i for i in items if i['kind']=='Работа']
+  works=[{**i,'price':0} if order.get('no_payment') else i for i in items if i['kind']=='Работа']
   rows=''.join(f'<tr><td>{e(i["name"])}</td><td>{i["quantity"]}</td><td>{rub(i["price"])}</td><td>{rub(i["quantity"]*i["price"])}</td><td>{i["warranty"]} дн.</td></tr>' for i in works)
   total=sum(i['quantity']*i['price'] for i in works)
   content=shared+'<table><thead><tr><th>Выполненная работа</th><th>Кол.</th><th>Цена</th><th>Сумма</th><th>Гарантия</th></tr></thead><tbody>'+rows+'</tbody></table><p class="total">Итого за работы: '+rub(total)+'</p>'

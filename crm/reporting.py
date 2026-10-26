@@ -2,8 +2,9 @@
 from datetime import datetime, date, timedelta, timezone
 
 def accrue_salary(c,oid,timestamp):
- for item in c.execute("SELECT * FROM items WHERE order_id=? AND kind='Работа'",(oid,)).fetchall():
-  revenue=item['quantity']*item['price']
+ for item in c.execute("SELECT * FROM items WHERE order_id=? AND kind='Работа' AND deleted=0",(oid,)).fetchall():
+  free=c.execute('SELECT no_payment FROM orders WHERE id=?',(oid,)).fetchone()[0]
+  revenue=0 if free else item['quantity']*item['price']
   cost=c.execute('SELECT coalesce(sum(quantity*unit_cost),0) FROM item_parts WHERE item_id=?',(item['id'],)).fetchone()[0]
   net=revenue-cost
   share=(max(0,net)*40+50)//100
@@ -19,7 +20,7 @@ def dashboard(c,user,branch_ids,query):
   branch_ids=[int(bid)]
  lower=(datetime.combine(start,datetime.min.time())-timedelta(hours=3)).isoformat(' ')
  upper=(datetime.combine(end+timedelta(days=1),datetime.min.time())-timedelta(hours=3)).isoformat(' ')
- allowed={o['id']:o for o in c.execute('SELECT id,branch_id,master_id,created,issued_at,status FROM orders') if o['branch_id'] in branch_ids and (user['role']!='master' or o['master_id']==user['id'] or c.execute('SELECT 1 FROM items WHERE order_id=? AND master_id=?',(o['id'],user['id'])).fetchone())}
+ allowed={o['id']:o for o in c.execute('SELECT id,branch_id,master_id,created,issued_at,status FROM orders') if o['branch_id'] in branch_ids and (user['role']!='master' or o['master_id']==user['id'] or c.execute('SELECT 1 FROM items WHERE order_id=? AND master_id=? AND deleted=0',(o['id'],user['id'])).fetchone())}
  accepted=sum(lower<=o['created']<upper for o in allowed.values())
  issued=sum(bool(o['issued_at']) and lower<=o['issued_at']<upper for o in allowed.values())
  payroll={};revenue=cost=master_total=service=0
