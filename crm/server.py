@@ -2,6 +2,7 @@ import os, json, sqlite3, secrets, hashlib, hmac, time
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from http.cookies import SimpleCookie
+from urllib.parse import urlsplit, parse_qs
 
 ROOT = Path(__file__).parent
 DB = os.environ.get('CRM_DB', str(ROOT / 'data.sqlite3'))
@@ -11,9 +12,29 @@ def connection():
 def password(value, salt=None):
  salt=salt or secrets.token_hex(16)
  return salt+':'+hashlib.scrypt(value.encode(),salt=salt.encode(),n=16384,r=8,p=1).hex()
+def normalize_phone(value):
+ digits=''.join(ch for ch in str(value) if ch in '0123456789')
+ if len(digits)==11 and digits.startswith('8'): digits='7'+digits[1:]
+ if len(digits)==10: digits='7'+digits
+ return digits
+
+def save_catalog(c,kind,value):
+ value=' '.join(str(value).split())
+ if kind not in ('device','appearance','fault') or not value or len(value)>300:
+  raise ValueError('Укажите вариант длиной до 300 символов')
+ c.execute('INSERT OR IGNORE INTO catalog(kind,value,normalized) VALUES(?,?,?)',(kind,value,value.casefold()))
+
+def save_client(c,name,phone):
+ normalized=normalize_phone(phone)
+ if not 7<=len(normalized)<=15: raise ValueError('Проверьте номер телефона: от 7 до 15 цифр')
+ c.execute('INSERT INTO clients(name,phone,normalized_phone) VALUES(?,?,?) ON CONFLICT(normalized_phone) DO UPDATE SET name=excluded.name,phone=excluded.phone',(name.strip(),phone.strip(),normalized))
+
 def initialize():
  with connection() as c:
   c.executescript('''
+CREATE TABLE IF NOT EXISTS clients(id INTEGER PRIMARY KEY,name TEXT NOT NULL,phone TEXT NOT NULL,normalized_phone TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS catalog(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,value TEXT NOT NULL,normalized TEXT NOT NULL,UNIQUE(kind,normalized));
+CREATE TABLE IF NOT EXISTS migrations(name TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS branches(id INTEGER PRIMARY KEY,name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL,active INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS access(user_id INTEGER REFERENCES users(id),branch_id INTEGER REFERENCES branches(id),PRIMARY KEY(user_id,branch_id));
@@ -23,6 +44,15 @@ CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY,order_id INTEGER REFEREN
 CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY,order_id INTEGER REFERENCES orders(id),amount INTEGER NOT NULL,method TEXT NOT NULL,created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,order_id INTEGER REFERENCES orders(id),user_id INTEGER REFERENCES users(id),text TEXT NOT NULL,created TEXT DEFAULT CURRENT_TIMESTAMP);
 ''')
+  if not c.execute("SELECT 1 FROM migrations WHERE name='client_catalog_v1'").fetchone():
+   for o in c.execute('SELECT * FROM orders ORDER BY id').fetchall():
+    digits=normalize_phone(o['phone'])
+    if digits:
+     c.execute('INSERT INTO clients(name,phone,normalized_phone) VALUES(?,?,?) ON CONFLICT(normalized_phone) DO UPDATE SET name=excluded.name,phone=excluded.phone',(o['client'],o['phone'],digits))
+    for kind in ('device','appearance','fault'):
+     for value in (o[kind] or '').split(';'):
+      if value.strip() and len(' '.join(value.split()))<=300:save_catalog(c,kind,value)
+   c.execute("INSERT INTO migrations VALUES('client_catalog_v1')")
 def money(v):
  from decimal import Decimal, InvalidOperation
  try:
@@ -49,7 +79,7 @@ class Handler(BaseHTTPRequestHandler):
   except sqlite3.IntegrityError:self.reply({'error':'Проверьте данные: запись уже существует или связана с другими данными'},400)
   except Exception:self.reply({'error':'Внутренняя ошибка сервера'},500)
  def api(self,c):
-  p=self.path; data={}
+  url=urlsplit(self.path);p=url.path;query=parse_qs(url.query);data={}
   if self.command=='POST':
    if self.headers.get('Sec-Fetch-Site')=='cross-site':self.reply({'error':'Запрос запрещен'},403);return
    if self.headers.get('Content-Type','').split(';')[0]!='application/json':raise ValueError('Ожидается JSON')
@@ -79,6 +109,23 @@ class Handler(BaseHTTPRequestHandler):
    if not owner:
     users=[{k:v for k,v in x.items() if k!='email'} for x in users]
    self.reply({'user':{'id':u['id'],'name':u['name'],'role':u['role']},'branches':branches,'users':users,'statuses':STATUSES});return
+  if p in ('/api/catalog','/api/clients'):
+   if u['role']=='master':self.reply({'error':'Справочники доступны приёмщику и владельцу'},403);return
+   if p=='/api/catalog':
+    if self.command=='POST':
+     save_catalog(c,data['kind'],data['value'])
+    self.reply([dict(x) for x in c.execute('SELECT id,kind,value FROM catalog ORDER BY id')]);return
+   if self.command!='GET':self.reply({'error':'Метод не поддерживается'},405);return
+   term=' '.join(query.get('q',[''])[0].split()).casefold()
+   if len(term)<2:self.reply([]);return
+   digits=normalize_phone(term)
+   # Client contacts are shared by the company; order access remains scoped by branch.
+   matches=[]
+   for row in c.execute('SELECT id,name,phone,normalized_phone FROM clients ORDER BY id DESC'):
+    if term in row['name'].casefold() or (digits and digits in row['normalized_phone']):
+     matches.append({'id':row['id'],'name':row['name'],'phone':row['phone']})
+     if len(matches)==20:break
+   self.reply(matches);return
   if p in ('/api/branches','/api/users') and self.command=='POST':
    if not owner:self.reply({'error':'Только владелец'},403);return
    if p.endswith('branches'):
@@ -107,6 +154,11 @@ class Handler(BaseHTTPRequestHandler):
    if master and not c.execute("SELECT 1 FROM users WHERE id=? AND active=1 AND (role='owner' OR EXISTS(SELECT 1 FROM access WHERE user_id=users.id AND branch_id=?))",(master,int(data['branch_id']))).fetchone():raise ValueError('Мастер не имеет доступа к филиалу')
    keys=['branch_id','client','phone','device','serial','appearance','equipment','fault','comment','master_id','deadline','estimate']
    values=[data.get(k,'') for k in keys];values[0]=int(data['branch_id']);values[9]=master;values[11]=money(data.get('estimate',0))
+   # Save the reusable values and client in the same transaction as the order.
+   save_client(c,data['client'],data['phone'])
+   for kind in ('device','appearance','fault'):
+    for value in str(data.get(kind,'')).split(';'):
+     if value.strip():save_catalog(c,kind,value)
    oid=c.execute('INSERT INTO orders('+','.join(keys)+',status) VALUES('+','.join('?' for _ in range(13))+')',values+['Новый']).lastrowid;event(oid,'Заказ создан');self.reply({'id':oid});return
   if p.startswith('/api/orders/'):
    parts=p.split('/');oid=int(parts[3]);o=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()

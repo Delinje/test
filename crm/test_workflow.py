@@ -1,3 +1,4 @@
+import urllib.parse
 import unittest, tempfile, subprocess, os, sys, time, json, urllib.request, urllib.error, http.cookiejar, socket
 from pathlib import Path
 
@@ -52,5 +53,65 @@ class Workflow(unittest.TestCase):
   self.assertEqual(self.call(a,'users',{'disable':2})[0],200)
   self.assertEqual(self.call(master,'orders')[0],401)
   self.assertEqual(self.call(a,'orders')[1][0]['paid'],550025)
+
+class ClientCatalogWorkflow(Workflow):
+ def test_repair_and_permissions(self):
+  a=self.owner
+  self.call(a,'setup',{'name':'Владелец','email':'owner@example.test','password':'test-password-123','branch':'Центр'})
+  self.call(a,'login',{'email':'owner@example.test','password':'test-password-123'})
+  self.assertEqual(self.call(self.client(),'catalog')[0],401)
+  self.call(a,'branches',{'name':'Север'})
+  self.call(a,'users',{'name':'Приёмщик','email':'manager@example.test','password':'test-password-123','role':'manager','branches':[2]})
+  self.call(a,'users',{'name':'Мастер','email':'master@example.test','password':'test-password-123','role':'master','branches':[1]})
+  for value in ['Apple iPhone 13','  APPLE   IPHONE 13  ']:
+   self.assertEqual(self.call(a,'catalog',{'kind':'device','value':value})[0],200)
+  self.assertEqual(len(self.call(a,'catalog')[1]),1)
+  self.assertEqual(self.call(a,'catalog',{'kind':'unknown','value':'test'})[0],400)
+  self.assertEqual(self.call(a,'catalog',{'kind':'fault','value':' '})[0],400)
+  self.assertEqual(self.call(a,'catalog',{'kind':'fault','value':'x'*301})[0],400)
+  order={'branch_id':1,'client':'Иванов Иван Иванович','phone':'+7 (900) 123-45-67','device':'Apple iPhone 13','fault':'Не включается; Нет зарядки','appearance':'Царапины; Потёртости'}
+  self.assertEqual(self.call(a,'orders',order)[0],200)
+  for term in ['иванов','ИВАНОВ','900123','8 (900) 123-45-67','+7 (900) 123-45-67']:
+   result=self.call(a,'clients?q='+urllib.parse.quote(term))[1]
+   self.assertEqual(len(result),1,term);self.assertEqual(result[0]['name'],order['client']);self.assertEqual(result[0]['phone'],order['phone'])
+  self.assertEqual(self.call(a,'clients?q='+urllib.parse.quote('несуществующий'))[1],[])
+  manager=self.client();self.call(manager,'login',{'email':'manager@example.test','password':'test-password-123'})
+  self.assertEqual(len(self.call(manager,'clients?q='+urllib.parse.quote('Иванов'))[1]),1)
+  self.assertEqual(self.call(manager,'orders')[1],[])
+  self.assertEqual(self.call(a,'orders',{**order,'phone':'8 900 123 45 67'})[0],200)
+  self.assertEqual(len(self.call(a,'clients?q=900123')[1]),1)
+  catalog=self.call(a,'catalog')[1]
+  self.assertEqual(len(catalog),5)
+  self.assertEqual({x['value'] for x in catalog if x['kind']=='appearance'},{'Царапины','Потёртости'})
+  master=self.client();self.call(master,'login',{'email':'master@example.test','password':'test-password-123'})
+  self.assertEqual(self.call(master,'clients?q=900123')[0],403)
+  self.assertEqual(self.call(master,'catalog')[0],403)
+  self.assertEqual(self.call(a,'orders',{**order,'phone':'abc'})[0],400)
+  self.assertEqual(len(self.call(a,'orders')[1]),2)
+  # Restart to verify persistent clients and options and migration repeatability.
+  self.process.terminate();self.process.wait()
+  self.__class__.process=subprocess.Popen([sys.executable,str(Path(__file__).with_name('server.py'))],env={**os.environ,'CRM_DB':self.tmp.name+'/test.sqlite3','PORT':self.url.split(':')[-1].split('/')[0]},stdout=subprocess.DEVNULL)
+  for _ in range(80):
+   try:self.call(a,'setup');break
+   except OSError:time.sleep(.05)
+  self.assertEqual(len(self.call(a,'clients?q=900123')[1]),1)
+  self.assertEqual(len(self.call(a,'catalog')[1]),5)
+
+class Migration(unittest.TestCase):
+ def test_existing_orders_backfilled_without_changes(self):
+  import importlib.util,sqlite3
+  spec=importlib.util.spec_from_file_location('crm_server',Path(__file__).with_name('server.py'));module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+  with tempfile.TemporaryDirectory() as directory:
+   module.DB=directory+'/old.sqlite3';module.initialize()
+   with module.connection() as c:
+    c.execute("DELETE FROM migrations")
+    c.execute("INSERT INTO branches(name) VALUES('Центр')")
+    c.execute("INSERT INTO orders(branch_id,client,phone,device,fault,appearance,status) VALUES(1,'Петров Пётр','8 (900) 555-66-77','Ноутбук','Не включается','Царапины','Новый')")
+    before=tuple(c.execute('SELECT * FROM orders').fetchone())
+   module.initialize();module.initialize()
+   with module.connection() as c:
+    self.assertEqual(tuple(c.execute('SELECT * FROM orders').fetchone()),before)
+    self.assertEqual(c.execute('SELECT normalized_phone FROM clients').fetchone()[0],'79005556677')
+    self.assertEqual(c.execute('SELECT count(*) FROM catalog').fetchone()[0],3)
 
 if __name__=='__main__':unittest.main(verbosity=2)
